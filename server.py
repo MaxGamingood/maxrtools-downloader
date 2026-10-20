@@ -23,6 +23,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -407,6 +408,7 @@ class Handler(BaseHTTPRequestHandler):
                     'filename': os.path.basename(path),
                 })
             except Exception as exc:
+                print('[hosted] exception: ' + traceback.format_exc()[-4000:], flush=True)
                 return self._json(200, error('error.api.fetch.fail', safe_detail(exc)))
             finally:
                 if not keep:
