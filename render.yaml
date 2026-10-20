@@ -4,7 +4,7 @@ services:
     runtime: docker
     plan: free
     region: oregon
-    healthCheckPath: /
+    healthCheckPath: /health
     envVars:
       - key: PORT
         value: 10000
@@ -28,5 +28,5 @@ services:
         value: 1800
       - key: MAX_HEIGHT
         value: 720
-      - key: YTDLP_PROXY
-        sync: false
+      - key: USE_WARP
+        value: 1

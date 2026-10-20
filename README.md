@@ -4,6 +4,12 @@ A small public download backend for the MaxTools **YT Save** tab. It runs
 `yt-dlp` + `ffmpeg` on a cloud server, so visitors do **not** install the local
 helper and the owner's PC can be off.
 
+The hosted image uses a free Cloudflare WARP egress by default. That avoids
+YouTube's usual datacenter login/bot wall without a card or a residential
+proxy; normal videos and the login-gated test video both work through it.
+WARP is a free network path, not a guarantee: if Cloudflare changes or blocks
+it, use a residential proxy or the home-device option below.
+
 It is intentionally **anonymous-only**:
 
 - It does not accept browser cookies or Google account credentials.
@@ -15,31 +21,34 @@ It is intentionally **anonymous-only**:
 The service is cobalt-compatible for the subset MaxTools uses:
 
 ```text
-GET  /                 health
+GET  /                 status
+GET  /health           lightweight health check
 POST /                 start a download, return a tunnel URL
 GET  /file/<job-id>    stream the finished file (deleted after serving)
+HEAD /                 health-check probe
 OPTIONS /              CORS preflight
 ```
 
 ## No card?
 
-Oracle requires a card. If you cannot add one, see:
+Oracle requires a card. The current public deployment is on Render's free
+tier (no card) with WARP egress; it passed the target-video test.
 
-- `RENDER.md` — Render free tier, no card, but a datacenter IP may still be blocked.
-- `HOME_DEVICE.md` — Raspberry Pi/NAS/always-on Linux device with Tailscale Funnel; uses your home IP and needs no card, but the device must stay on.
+- `RENDER.md` — Render free tier, no card, WARP egress (the current setup).
+- `HOME_DEVICE.md` — Raspberry Pi/NAS/always-on Linux device with Tailscale
+  Funnel; uses your home IP and needs no card, but the device must stay on.
 
 ## Requirements
 
-- A small Linux VPS (1 vCPU / 1–2 GB RAM is enough for audio and 720p; use
-  2 vCPU / 2 GB if several people download at once).
-- Docker Engine and Docker Compose on the VPS.
-- A public hostname with TLS. You can use a free `sslip.io` name such as
-  `api.203.0.113.10.sslip.io` if you do not own a domain.
-- **A residential/ISP proxy is normally required.** YouTube shows its
-  login/bot wall to datacenter IPs. Without a residential proxy, normal public
-  videos may work, but login-walled videos such as `hjzAcsHbT0w` will still
-  return an empty tunnel or `error.api.youtube.login`.
-- Ports 80 and 443 reachable from the internet.
+- For Render: a free Render account and a public Git repository. No card.
+- For a self-hosted VPS: a small Linux server (1 vCPU / 1–2 GB RAM is enough
+  for audio and 720p), Docker Engine + Docker Compose, and a public hostname
+  with TLS.
+- Ports 80 and 443 reachable from the internet for the self-hosted Caddy setup.
+- **Egress:** the Render image starts a userspace Cloudflare WARP client and
+  routes yt-dlp through it. For a self-hosted VPS you can enable WARP, use a
+  residential/ISP proxy, or run on a home connection. A residential proxy is
+  no longer required for the hosted setup.
 
 ## Deploy
 
@@ -54,10 +63,10 @@ On the VPS:
 ```bash
 cd /opt/maxrtools-hosted
 cp .env.example .env
-nano .env          # set DOMAIN, PUBLIC_BASE_URL and YTDLP_PROXY
+nano .env          # set DOMAIN and PUBLIC_BASE_URL; keep USE_WARP=0 for home IP
 docker compose up -d --build
 docker compose ps
-curl -fsS https://YOUR_DOMAIN/
+curl -fsS https://YOUR_DOMAIN/health
 ```
 
 `DOMAIN` and `PUBLIC_BASE_URL` must match. Example:
@@ -70,11 +79,27 @@ PUBLIC_BASE_URL=https://api.203.0.113.10.sslip.io
 Caddy obtains and renews the HTTPS certificate automatically. Do not expose
 port 8080 publicly; only Caddy needs 80/443.
 
-### Residential proxy
+For Render, use the Docker image directly. The image defaults to
+`USE_WARP=1`; you do not need an `.env` file or a card. See `RENDER.md`.
 
-Set the proxy in `.env`:
+### WARP (Render default)
+
+The image starts a fresh free WARP identity at boot and exposes it as a local
+SOCKS5 proxy. The downloader then uses
+`YTDLP_PROXY=socks5h://127.0.0.1:25344`. No user Google account or cookies are
+involved. The account is ephemeral and is recreated when the container
+restarts.
+
+Keep `USE_WARP=1` only when the container's own network is a datacenter (Render
+or a VPS). For a home device, use `USE_WARP=0` so downloads use your home IP.
+If WARP is blocked, switch to a residential/ISP proxy or the home-device setup.
+
+### Residential proxy (optional)
+
+For a self-hosted VPS, disable WARP and set a proxy in `.env`:
 
 ```dotenv
+USE_WARP=0
 YTDLP_PROXY=http://USER:PASSWORD@HOST:PORT
 ```
 
@@ -95,9 +120,9 @@ Replace the host with your deployed HTTPS hostname:
 API=https://api.203.0.113.10.sslip.io
 
 # health
-curl -fsS "$API/"
+curl -fsS "$API/health"
 
-# audio
+# audio (also works for the login-gated target through WARP)
 curl -fsS -X POST "$API/" \
   -H 'Origin: https://maxrtools.netlify.app' \
   -H 'Content-Type: application/json' \
@@ -110,19 +135,21 @@ removed after it is served or after `JOB_TTL` seconds.
 
 ## Limits and abuse
 
-Defaults are deliberately modest:
+The Render service is configured with deliberately modest limits:
 
-- 2 concurrent downloads
-- 8 requests per IP per 60 seconds
+- 1 concurrent download
+- 6 requests per IP per 60 seconds
 - 10-minute download timeout
 - 100 MB maximum file size
 - 30-minute maximum video duration
-- 1080p maximum output height
+- 720p maximum output height
 
-Edit `.env` and restart if needed. This service has **no login**; if you open it
-to a large audience, add Cloudflare Turnstile or an access token, monitor
-bandwidth, and keep the proxy bill in mind. Do not run it as an open download
-proxy for arbitrary URLs — the server only accepts YouTube links.
+The `.env.example` defaults for a private self-host are 2 concurrent and 8
+requests per minute. Edit `.env` and restart if needed. This service has **no
+login**; if you open it to a large audience, add Cloudflare Turnstile or an
+access token, monitor bandwidth, and keep the proxy bill in mind. Do not run it
+as an open download proxy for arbitrary URLs — the server only accepts YouTube
+links.
 
 ## Updating yt-dlp
 
@@ -137,10 +164,12 @@ curl -fsS https://YOUR_DOMAIN/
 
 ## Connecting MaxTools
 
-After the API is healthy, change the page's default server from the public
-cobalt instance to the hosted URL, or enter the URL in **YT Save → Server** for
-testing. The existing page sends account fields only to loopback, so the
-hosted service never receives them.
+The live page uses `https://maxrtools-downloader.onrender.com` as its default
+server. To use a different deployment, enter its URL in **YT Save → Server**;
+the page sends account fields only to loopback, so the hosted service never
+receives them.
 
 The public downloader is anonymous-only. Account login remains available only
-through the local helper, where cookies stay on the user's device.
+through the local helper, where cookies stay on the user's device. The page
+tries the hosted server anonymously first and falls back to the local helper
+only when needed.

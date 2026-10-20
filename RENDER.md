@@ -1,72 +1,73 @@
-# Try Render's free tier (no card)
+# Render free tier (no card) — current deployment
 
-Render's free web-service tier does not require a credit card. It is a **test**
-option, not a guaranteed fix: Render runs on datacenter IPs, so YouTube may
-still block the target video. It also spins down after 15 minutes of inactivity
-and has 0.1 CPU / 512 MB RAM.
-
-If it works for your video, great. If the target still fails, you need a
-residential proxy or a machine on a home connection.
-
-## 1. Put the folder in a public Git repository
-
-Render deploys from GitHub/GitLab/Bitbucket (or a public Git URL). The easiest
-path is a free GitHub account:
-
-1. Create a new **public** repository, e.g. `maxrtools-downloader`.
-2. Upload the contents of `/home/maxr/hosted-backend/` (not the folder itself):
-   - `Dockerfile`
-   - `server.py`
-   - `render.yaml`
-   - `README.md`
-   - `ORACLE.md`
-   - `Caddyfile`
-   - `docker-compose.yml`
-   - `.env.example`
-   - `.dockerignore`
-   - `deploy-oracle.sh`
-3. Commit.
-
-The `Dockerfile` is enough; `render.yaml` is optional.
-
-## 2. Create the Render service
-
-1. Sign up at <https://dashboard.render.com/register> with GitHub (no card).
-2. **New → Web Service**.
-3. Connect the repository.
-4. Runtime: **Docker**.
-5. Plan: **Free**.
-6. Health check path: `/`.
-7. Add environment variables:
-
-   ```text
-   ALLOWED_ORIGINS=https://maxrtools.netlify.app
-   TRUST_PROXY=1
-   MAX_CONCURRENT=1
-   RATE_LIMIT=6
-   RATE_WINDOW=60
-   MAX_HEIGHT=720
-   MAX_FILESIZE=100M
-   MAX_DURATION=1800
-   ```
-
-   `PORT` is provided by Render. Do not set `PUBLIC_BASE_URL` manually; the
-   server derives it from Render's forwarded host/proto.
-8. Deploy.
-
-Render gives you an HTTPS URL such as:
+The public service runs on Render's free web-service tier:
 
 ```text
 https://maxrtools-downloader.onrender.com
 ```
 
-## 3. Test
+It uses the Docker image in this folder. No card is required. The image starts
+a fresh free Cloudflare WARP identity at boot and routes `yt-dlp` through a
+local SOCKS5 proxy, so YouTube does not see Render's datacenter IP directly.
+The login-gated test video `hjzAcsHbT0w` has been tested end-to-end (MP3 and
+720p MP4), along with ordinary videos.
 
-The first request after a sleep may take about a minute.
+WARP is a free third-party network path, not a permanent guarantee. If
+Cloudflare blocks it, use a residential/ISP proxy or the home-device setup in
+`HOME_DEVICE.md`.
+
+## Service settings
+
+- Runtime: Docker
+- Plan: Free
+- Region: Oregon
+- Branch: `main`
+- Dockerfile: `./Dockerfile`
+- Health check path: `/health`
+- Public repo: <https://github.com/MaxGamingood/maxrtools-downloader>
+
+Environment:
+
+```text
+ALLOWED_ORIGINS=https://maxrtools.netlify.app
+TRUST_PROXY=1
+MAX_CONCURRENT=1
+RATE_LIMIT=6
+RATE_WINDOW=60
+DOWNLOAD_TIMEOUT=600
+JOB_TTL=300
+MAX_FILESIZE=100M
+MAX_DURATION=1800
+MAX_HEIGHT=720
+```
+
+The image defaults to `USE_WARP=1` and
+`YTDLP_PROXY=socks5h://127.0.0.1:25344`. Do not set `YTDLP_PROXY` in the
+Render dashboard unless you are deliberately replacing WARP. Render supplies
+`PORT`; do not set `PUBLIC_BASE_URL` manually because the server derives it
+from the forwarded host/proto headers.
+
+## Deploy from scratch
+
+1. Push this folder to a public GitHub repository. The required files are
+   `Dockerfile`, `entrypoint.sh`, `server.py`, `render.yaml`, and the docs.
+2. In Render: **New → Web Service**, connect the repo, choose **Docker** and
+   **Free**.
+3. Set the health check path to `/health` and add the environment variables
+   above.
+4. Deploy. The first build downloads `ffmpeg`, `yt-dlp`, `wgcf`, and
+   `wireproxy`, then starts WARP before the HTTP server.
+5. The free service is live at a URL like
+   `https://maxrtools-downloader.onrender.com`.
+
+## Test
+
+The first request after a 15-minute sleep can take about a minute while Render
+starts the container and WARP connects.
 
 ```bash
 API=https://maxrtools-downloader.onrender.com
-curl -fsS "$API/"
+curl -fsS "$API/health"
 
 curl -fsS -X POST "$API/" \
   -H 'Origin: https://maxrtools.netlify.app' \
@@ -74,19 +75,16 @@ curl -fsS -X POST "$API/" \
   -d '{"url":"https://www.youtube.com/watch?v=hjzAcsHbT0w","downloadMode":"audio","audioFormat":"mp3"}'
 ```
 
-If the POST returns a tunnel URL, fetch it and check the size. If it returns
-`error.api.youtube.login` or an empty tunnel, Render's IP is blocked and no
-amount of code will fix that without a residential proxy.
-
-## 4. If it works
-
-Point the page's server field at the Render URL for a test, or update
-`YT_API_DEFAULT` in `tools.html` and bump `CHANGELOG_V` for production.
+Expected: a JSON response with `"status":"tunnel"` and a `/file/...` URL.
+Fetch that URL and verify a non-zero MP3. A 720p MP4 request uses
+`"downloadMode":"video","videoQuality":"720"`.
 
 ## Limits to expect
 
-- 15-minute idle spin-down: the first request after that is slow.
-- 512 MB RAM / 0.1 CPU: audio is realistic; 720p video may be slow or fail.
-- No persistent disk: temp files disappear on restart; that is fine.
+- 15-minute idle spin-down; cold starts are slow.
+- 512 MB RAM / 0.1 CPU: audio is comfortable; 720p can take tens of seconds.
+- No persistent disk: temp files disappear on restart.
 - Free bandwidth is limited; public use can exhaust it.
-- Render is not a residential IP; the target may still fail.
+- WARP egress can be rate-limited or blocked; keep the home-device option as
+  a fallback.
+- The service is anonymous-only and does not accept account cookies.

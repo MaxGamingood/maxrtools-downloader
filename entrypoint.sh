@@ -16,7 +16,13 @@ if [ "${USE_WARP:-0}" = "1" ]; then
     wgcf generate
     printf '\n[Socks5]\nBindAddress = 127.0.0.1:25344\n' >> wgcf-profile.conf
 
-    wireproxy -c wgcf-profile.conf -s &
+    (
+        while true; do
+            wireproxy -c wgcf-profile.conf -s
+            echo "wireproxy exited; restarting in 2s" >&2
+            sleep 2
+        done
+    ) &
     WARP_PID=$!
 
     ready=0
