@@ -237,13 +237,39 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Length', '0')
         self.end_headers()
 
+    def do_HEAD(self):
+        # Render's health checker probes with HEAD; answer it without running
+        # yt-dlp or writing a response body.
+        if not self._origin_allowed():
+            self.send_response(403)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
+        path = urlparse(self.path).path
+        if path in ('/', '/health'):
+            self.send_response(200)
+            self._cors()
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
     def do_GET(self):
         if not self._origin_allowed():
             return self._json(403, error('error.api.origin.denied'))
         path = urlparse(self.path).path
         if path.startswith('/file/'):
             return self._serve(path.split('/', 2)[2])
-        if path in ('/', '/health'):
+        if path == '/health':
+            return self._json(200, {
+                'status': 'ok',
+                'name': 'MaxTools hosted downloader',
+                'account': False,
+            })
+        if path == '/':
             binary = find_ytdlp()
             return self._json(200, {
                 'status': 'ok',
