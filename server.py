@@ -128,7 +128,9 @@ def safe_detail(text):
 
 
 def classify_failure(stderr):
-    low = (stderr or '').lower()
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode('utf-8', 'replace')
+    low = str(stderr or '').lower()
     if 'sign in to confirm' in low or 'login' in low or 'bot' in low:
         return 'error.api.youtube.login'
     if 'video unavailable' in low or 'private video' in low:
