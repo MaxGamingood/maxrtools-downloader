@@ -66,7 +66,7 @@ cp .env.example .env
 nano .env          # set DOMAIN and PUBLIC_BASE_URL; keep USE_WARP=0 for home IP
 docker compose up -d --build
 docker compose ps
-curl -fsS https://YOUR_DOMAIN/health
+curl -fsS https://YOUR_DOMAIN/healthhealth
 ```
 
 `DOMAIN` and `PUBLIC_BASE_URL` must match. Example:
@@ -159,15 +159,16 @@ YouTube changes frequently. Rebuild periodically:
 cd /opt/maxrtools-hosted
 docker compose build --no-cache api
 docker compose up -d
-curl -fsS https://YOUR_DOMAIN/
+curl -fsS https://YOUR_DOMAIN/health
 ```
 
 ## Connecting MaxTools
 
-The live page uses `https://maxrtools-downloader.onrender.com` as its default
-server. To use a different deployment, enter its URL in **YT Save → Server**;
-the page sends account fields only to loopback, so the hosted service never
-receives them.
+The prepared v90 page uses
+`https://maxrtools-downloader.onrender.com` as its default server. Until that
+page is published, enter the URL in **YT Save → Server** or use the existing
+default. The page sends account fields only to loopback, so the hosted service
+never receives them.
 
 The public downloader is anonymous-only. Account login remains available only
 through the local helper, where cookies stay on the user's device. The page
