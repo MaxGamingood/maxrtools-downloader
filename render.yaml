@@ -1,0 +1,32 @@
+services:
+  - type: web
+    name: maxrtools-downloader
+    runtime: docker
+    plan: free
+    region: oregon
+    healthCheckPath: /
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: ALLOWED_ORIGINS
+        value: https://maxrtools.netlify.app
+      - key: TRUST_PROXY
+        value: 1
+      - key: MAX_CONCURRENT
+        value: 1
+      - key: RATE_LIMIT
+        value: 6
+      - key: RATE_WINDOW
+        value: 60
+      - key: DOWNLOAD_TIMEOUT
+        value: 600
+      - key: JOB_TTL
+        value: 300
+      - key: MAX_FILESIZE
+        value: 100M
+      - key: MAX_DURATION
+        value: 1800
+      - key: MAX_HEIGHT
+        value: 720
+      - key: YTDLP_PROXY
+        sync: false
