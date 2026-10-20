@@ -50,6 +50,8 @@ YTDLP_PROXY = os.environ.get('YTDLP_PROXY', '').strip()
 YT_RE = re.compile(r'^https?://(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)/', re.I)
 QUAL = ('max', '2160', '1440', '1080', '720', '480', '360', '240')
 AUDIO = ('mp3', 'm4a', 'opus', 'wav')
+YT_CLIENTS = ('android', 'ios', 'tv', 'mweb', 'web', 'web_safari',
+              'web_embedded', 'tv_embedded', 'android_vr')
 SEM = threading.BoundedSemaphore(MAX_CONCURRENT)
 
 
@@ -78,7 +80,7 @@ def error(code, detail=None):
     return {'status': 'error', 'error': body}
 
 
-def build_cmd(binary, req, outdir, proxy=None):
+def build_cmd(binary, req, outdir, proxy=None, client=None):
     quality = str(req.get('videoQuality') or '720').strip()
     if quality not in QUAL:
         quality = '720'
@@ -93,6 +95,8 @@ def build_cmd(binary, req, outdir, proxy=None):
            '--fragment-retries', '3', '-o', out]
     if proxy:
         cmd += ['--proxy', proxy]
+    if client in YT_CLIENTS:
+        cmd += ['--extractor-args', 'youtube:player_client=' + client]
     if MAX_FILESIZE:
         cmd += ['--max-filesize', MAX_FILESIZE]
     if MAX_DURATION > 0:
@@ -336,6 +340,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, error('error.api.cookies.unsupported',
                                          'Account cookies are not accepted by the hosted downloader'))
 
+        client = self.headers.get('X-MaxTools-Client', '').strip()
+        if client not in YT_CLIENTS:
+            client = None
         ip = client_ip(self)
         if not rate_ok(ip):
             return self._json(429, error('error.api.rate_exceeded'))
@@ -348,28 +355,30 @@ class Handler(BaseHTTPRequestHandler):
             outdir = tempfile.mkdtemp(prefix='maxrtools-hosted-')
             keep = False
             try:
-                def attempt(proxy):
-                    cmd = build_cmd(binary, req, outdir, proxy)
+                def attempt(proxy, yt_client=None):
+                    cmd = build_cmd(binary, req, outdir, proxy, yt_client)
                     started = time.time()
                     try:
                         proc = subprocess.run(cmd, capture_output=True, timeout=TIMEOUT)
                     except FileNotFoundError:
-                        return None, None, 'error.api.ytdlp.missing'
+                        return None, None, 'error.api.ytdlp.missing', None
                     except subprocess.TimeoutExpired:
-                        return None, None, 'error.api.timeout'
+                        return None, None, 'error.api.timeout', None
                     files = [os.path.join(outdir, f) for f in os.listdir(outdir)
                              if not f.endswith('.part')]
                     files = [f for f in files if os.path.isfile(f) and os.path.getsize(f) > 0]
                     elapsed = time.time() - started
                     if proc.returncode == 0 and files:
                         path = max(files, key=os.path.getsize)
-                        print('[hosted] ok %.1fs mode=%s bytes=%d proxy=%s' % (
+                        print('[hosted] ok %.1fs mode=%s bytes=%d proxy=%s client=%s' % (
                             elapsed, req.get('downloadMode') or 'video',
-                            os.path.getsize(path), 'yes' if proxy else 'no'), flush=True)
-                        return path, None, None
+                            os.path.getsize(path), 'yes' if proxy else 'no',
+                            yt_client or 'default'), flush=True)
+                        return path, None, None, None
                     tail = ' '.join((proc.stderr or b'').decode('utf-8', 'replace')
                                     .strip().splitlines()[-2:])
                     tail = safe_detail(tail)
+                    fail_code = classify_failure(proc.stderr or b'')
                     # Clear partial output before another attempt.
                     for name in os.listdir(outdir):
                         p = os.path.join(outdir, name)
@@ -380,24 +389,26 @@ class Handler(BaseHTTPRequestHandler):
                                 pass
                         elif os.path.isdir(p):
                             shutil.rmtree(p, ignore_errors=True)
-                    print('[hosted] fail %.1fs proxy=%s code=%s' % (
-                        elapsed, 'yes' if proxy else 'no',
-                        classify_failure(proc.stderr or b'')), flush=True)
-                    return None, tail, None
+                    print('[hosted] fail %.1fs proxy=%s client=%s code=%s' % (
+                        elapsed, 'yes' if proxy else 'no', yt_client or 'default',
+                        fail_code), flush=True)
+                    return None, tail, None, fail_code
 
-                path, direct_detail, fatal = attempt(None)
+                path, direct_detail, fatal, direct_code = attempt(None, client)
                 if fatal:
                     return self._json(200, error(fatal))
                 proxy_detail = None
+                proxy_code = None
                 if not path and YTDLP_PROXY:
-                    path, proxy_detail, fatal = attempt(YTDLP_PROXY)
+                    path, proxy_detail, fatal, proxy_code = attempt(YTDLP_PROXY, client)
                     if fatal:
                         return self._json(200, error(fatal))
                 if not path:
                     detail = direct_detail or ''
                     if proxy_detail:
                         detail = ('direct: ' + detail + ' | proxy: ' + proxy_detail)[-300:]
-                    return self._json(200, error(classify_failure(detail), detail))
+                    code = direct_code or proxy_code or classify_failure(detail)
+                    return self._json(200, error(code, detail))
                 jid = uuid.uuid4().hex
                 now = time.time()
                 with LOCK:
