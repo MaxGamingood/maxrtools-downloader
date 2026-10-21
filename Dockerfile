@@ -4,7 +4,7 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     TMPDIR=/tmp \
     USE_WARP=1 \
-    YTDLP_PROXY=socks5h://127.0.0.1:25344
+    YTDLP_PROXY=socks5://127.0.0.1:25344
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg ca-certificates curl \
