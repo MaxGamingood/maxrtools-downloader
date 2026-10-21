@@ -93,8 +93,9 @@ curl -fsS -X POST "$API/stream" \
 
 The response is chunked and starts before the download finishes. Verify the
 MP3 is non-zero and playable. Use `"downloadMode":"auto","videoQuality":"720"`
-for MP4. If the first data takes too long, the server retries through WARP
-before sending any bytes, then returns a JSON error instead of a broken file.
+for MP4. The server tries WARP first and retries WARP once before falling back
+to direct; it only sends JSON after the attempts fail, never a broken media
+file.
 
 ## Limits to expect
 
