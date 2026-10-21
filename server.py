@@ -21,6 +21,7 @@ import re
 import select
 import shutil
 import signal
+import socket
 import subprocess
 import tempfile
 import threading
@@ -51,6 +52,10 @@ STREAM_FRAGMENTS = max(1, int(os.environ.get('STREAM_FRAGMENTS', '4')))
 PUBLIC_BASE_URL = os.environ.get('PUBLIC_BASE_URL', '').strip().rstrip('/')
 TRUST_PROXY = os.environ.get('TRUST_PROXY', '0').lower() in ('1', 'true', 'yes')
 YTDLP_PROXY = os.environ.get('YTDLP_PROXY', '').strip()
+WARP_DIR = os.environ.get('WARP_DIR', '/tmp/warp').strip()
+WARP_PORT = int(os.environ.get('WARP_PORT', '25344'))
+WARP_ROTATE = os.environ.get('WARP_ROTATE', '1').lower() in ('1', 'true', 'yes')
+WARP_LOCK = threading.Lock()
 YT_RE = re.compile(r'^https?://(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)/', re.I)
 QUAL = ('max', '2160', '1440', '1080', '720', '480', '360', '240')
 AUDIO = ('mp3', 'm4a', 'opus', 'wav')
@@ -79,7 +84,11 @@ def yt_version(binary):
 
 def error(code, detail=None):
     body = {'code': code}
-    if detail:
+    if code == 'error.api.youtube.login':
+        # Do not send a truncated yt-dlp sentence to the page. The raw
+        # stderr is still available in the Render logs for debugging.
+        body['detail'] = 'YouTube asked the server to sign in (bot check)'
+    elif detail:
         body['detail'] = str(detail)[-300:]
     return {'status': 'error', 'error': body}
 
@@ -206,6 +215,88 @@ def classify_failure(stderr):
     if 'timed out' in low or 'timeout' in low:
         return 'error.api.timeout'
     return 'error.api.fetch.fail'
+
+
+def needs_fresh_warp(detail):
+    low = str(detail or '').lower()
+    return ('sign in' in low or 'login' in low or 'bot' in low or
+            'cookie' in low)
+
+
+def _wait_warp_port():
+    for _ in range(60):
+        try:
+            sock = socket.create_connection(('127.0.0.1', WARP_PORT), 1)
+            sock.close()
+            return True
+        except OSError:
+            time.sleep(0.5)
+    return False
+
+
+def rotate_warp():
+    """Create a fresh free WARP identity and restart the local proxy.
+
+    YouTube occasionally rejects a shared WARP egress IP with its login/bot
+    challenge. A new free WARP identity gets a different egress address; the
+    supervisor loop in entrypoint.sh restarts wireproxy with the new profile.
+    """
+    if not WARP_ROTATE or not YTDLP_PROXY or not os.path.isdir(WARP_DIR):
+        return False
+    if not shutil.which('wgcf'):
+        return False
+    with WARP_LOCK:
+        tmp = tempfile.mkdtemp(prefix='maxrtools-warp-')
+        try:
+            reg = subprocess.run(
+                ['wgcf', 'register', '--accept-tos'], cwd=tmp,
+                capture_output=True, timeout=90)
+            if reg.returncode != 0:
+                print('[hosted] WARP rotate register failed: ' +
+                      safe_detail(reg.stderr), flush=True)
+                return False
+            gen = subprocess.run(
+                ['wgcf', 'generate'], cwd=tmp,
+                capture_output=True, timeout=45)
+            if gen.returncode != 0:
+                print('[hosted] WARP rotate generate failed: ' +
+                      safe_detail(gen.stderr), flush=True)
+                return False
+            profile = os.path.join(tmp, 'wgcf-profile.conf')
+            if not os.path.isfile(profile):
+                return False
+            with open(profile, 'a') as fh:
+                fh.write('\n[Socks5]\nBindAddress = 127.0.0.1:%d\n' % WARP_PORT)
+            for name in ('wgcf-profile.conf', 'wgcf-account.toml'):
+                src = os.path.join(tmp, name)
+                if os.path.isfile(src):
+                    os.replace(src, os.path.join(WARP_DIR, name))
+            try:
+                with open(os.path.join(WARP_DIR, 'wireproxy.pid')) as fh:
+                    pid = int(fh.read().strip())
+            except Exception:
+                pid = 0
+            if pid:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+                for _ in range(30):
+                    try:
+                        os.kill(pid, 0)
+                    except OSError:
+                        break
+                    time.sleep(0.2)
+            if _wait_warp_port():
+                print('[hosted] WARP identity rotated', flush=True)
+                return True
+            print('[hosted] WARP rotate did not become ready', flush=True)
+            return False
+        except Exception as exc:
+            print('[hosted] WARP rotate failed: ' + safe_detail(exc), flush=True)
+            return False
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 def client_ip(handler):
@@ -409,7 +500,9 @@ class Handler(BaseHTTPRequestHandler):
                     parts.append(text.strip()[-1200:])
             except Exception:
                 pass
-        return safe_detail(' | '.join(parts)[-1200:])
+        # Keep enough of each process's stderr for classify_failure() to see
+        # the yt-dlp sign-in/bot message even when ffmpeg adds a long tail.
+        return (' | '.join(parts))[-8000:]
 
     def _kill_stream(self, stream):
         for proc in list(stream.get('procs', [])) + [stream.get('ff')]:
@@ -528,20 +621,25 @@ class Handler(BaseHTTPRequestHandler):
                         'error.api.stream.unsupported',
                         'Live streaming is only available for MP3 audio'))
             # Hosted deployments need WARP: YouTube treats Render's datacenter
-            # IPs as bots. Try the proxy first (twice, since a cold WARP edge
-            # can be challenged once), then fall back to direct for
+            # IPs as bots. Try the proxy first, rotate WARP once if YouTube
+            # challenges that identity, then fall back to direct for
             # self-hosted deployments where the host IP is already clean.
-            proxies = [YTDLP_PROXY, YTDLP_PROXY] if YTDLP_PROXY else []
-            proxies.append(None)
+            attempts = []
+            if YTDLP_PROXY:
+                attempts.append((YTDLP_PROXY, False))
+                attempts.append((YTDLP_PROXY, True))
+            attempts.append((None, False))
             first = b''
             detail = ''
             used_proxy = None
-            for idx, proxy in enumerate(proxies):
+            for idx, (proxy, rotate) in enumerate(attempts):
+                if rotate and needs_fresh_warp(detail):
+                    rotate_warp()
                 try:
                     st = self._start_stream(binary, req, proxy, client)
                 except Exception as exc:
                     detail = safe_detail(exc)
-                    if idx == len(proxies) - 1:
+                    if idx == len(attempts) - 1:
                         return self._json(200, error('error.api.fetch.fail', detail))
                     continue
                 timer = threading.Timer(TIMEOUT, self._kill_stream, args=(st,))
@@ -572,11 +670,13 @@ class Handler(BaseHTTPRequestHandler):
                 if timer:
                     timer.cancel()
                     timer = None
+                print('[hosted] stream attempt failed proxy=%s code=%s' % (
+                    'yes' if proxy else 'no', classify_failure(detail)), flush=True)
                 if not YTDLP_PROXY:
                     break
             if not first or not st:
                 code = classify_failure(detail)
-                return self._json(200, error(code, detail))
+                return self._json(200, error(code, safe_detail(detail)))
 
             mode = str(req.get('downloadMode') or '')
             ext = 'mp3' if mode == 'audio' else 'mp4'
@@ -748,6 +848,13 @@ class Handler(BaseHTTPRequestHandler):
                     path, proxy_detail, fatal, proxy_code = attempt(YTDLP_PROXY, client)
                     if fatal:
                         return self._json(200, error(fatal))
+                    if not path and (proxy_code == 'error.api.youtube.login' or
+                                     needs_fresh_warp(proxy_detail)):
+                        if rotate_warp():
+                            path, proxy_detail, fatal, proxy_code = attempt(
+                                YTDLP_PROXY, client)
+                            if fatal:
+                                return self._json(200, error(fatal))
                 if not path:
                     path, direct_detail, fatal, direct_code = attempt(None, client)
                     if fatal:

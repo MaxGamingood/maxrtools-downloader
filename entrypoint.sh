@@ -18,7 +18,10 @@ if [ "${USE_WARP:-0}" = "1" ]; then
 
     (
         while true; do
-            wireproxy -c wgcf-profile.conf -s
+            wireproxy -c wgcf-profile.conf -s &
+            wire_pid=$!
+            echo "$wire_pid" > wireproxy.pid
+            wait "$wire_pid" || true
             echo "wireproxy exited; restarting in 2s" >&2
             sleep 2
         done
