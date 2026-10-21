@@ -528,9 +528,10 @@ class Handler(BaseHTTPRequestHandler):
                         'error.api.stream.unsupported',
                         'Live streaming is only available for MP3 audio'))
             # Hosted deployments need WARP: YouTube treats Render's datacenter
-            # IPs as bots. Try the proxy first, then fall back to direct for
+            # IPs as bots. Try the proxy first (twice, since a cold WARP edge
+            # can be challenged once), then fall back to direct for
             # self-hosted deployments where the host IP is already clean.
-            proxies = [YTDLP_PROXY] if YTDLP_PROXY else []
+            proxies = [YTDLP_PROXY, YTDLP_PROXY] if YTDLP_PROXY else []
             proxies.append(None)
             first = b''
             detail = ''
@@ -739,13 +740,16 @@ class Handler(BaseHTTPRequestHandler):
                         fail_code), flush=True)
                     return None, tail, None, fail_code
 
-                path, direct_detail, fatal, direct_code = attempt(None, client)
-                if fatal:
-                    return self._json(200, error(fatal))
+                direct_detail = None
+                direct_code = None
                 proxy_detail = None
                 proxy_code = None
-                if not path and YTDLP_PROXY:
+                if YTDLP_PROXY:
                     path, proxy_detail, fatal, proxy_code = attempt(YTDLP_PROXY, client)
+                    if fatal:
+                        return self._json(200, error(fatal))
+                if not path:
+                    path, direct_detail, fatal, direct_code = attempt(None, client)
                     if fatal:
                         return self._json(200, error(fatal))
                 if not path:
