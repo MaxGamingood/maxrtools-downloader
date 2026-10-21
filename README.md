@@ -89,11 +89,14 @@ The image starts a fresh free WARP identity at boot and exposes it as a local
 SOCKS5 proxy. The downloader then uses
 `YTDLP_PROXY=socks5h://127.0.0.1:25344`. No user Google account or cookies are
 involved. The account is ephemeral and is recreated when the container
-restarts.
+restarts. If YouTube challenges the current WARP egress with its login/bot
+check, the server creates a fresh WARP identity and retries once (disable with
+`WARP_ROTATE=0`).
 
 Keep `USE_WARP=1` only when the container's own network is a datacenter (Render
 or a VPS). For a home device, use `USE_WARP=0` so downloads use your home IP.
-If WARP is blocked, switch to a residential/ISP proxy or the home-device setup.
+If WARP stays blocked, switch to a residential/ISP proxy or the home-device
+setup.
 
 ### Residential proxy (optional)
 
