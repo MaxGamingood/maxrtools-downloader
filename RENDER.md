@@ -9,6 +9,8 @@ https://maxrtools-downloader.onrender.com
 It uses the Docker image in this folder. No card is required. The image starts
 a fresh free Cloudflare WARP identity at boot and routes `yt-dlp` through a
 local SOCKS5 proxy, so YouTube does not see Render's datacenter IP directly.
+If YouTube challenges that egress IP, the server creates a fresh WARP identity
+and restarts the proxy automatically.
 The login-gated test video `hjzAcsHbT0w` has been tested end-to-end (MP3 and
 720p MP4), along with ordinary videos.
 
@@ -41,6 +43,7 @@ MAX_DURATION=1800
 MAX_HEIGHT=720
 STREAM_FRAGMENTS=4
 STREAM_START_TIMEOUT=55
+WARP_ROTATE=1
 ```
 
 The image defaults to `USE_WARP=1` and
@@ -93,9 +96,10 @@ curl -fsS -X POST "$API/stream" \
 
 The response is chunked and starts before the download finishes. Verify the
 MP3 is non-zero and playable. Use `"downloadMode":"auto","videoQuality":"720"`
-for MP4. The server tries WARP first and retries WARP once before falling back
-to direct; it only sends JSON after the attempts fail, never a broken media
-file.
+for MP4. The server tries WARP first and retries with a fresh WARP identity if
+YouTube challenges it, before falling back to direct; it only sends JSON after
+the attempts fail, never a broken media file. The JSON login error is a short
+actionable message, not truncated yt-dlp stderr.
 
 ## Limits to expect
 
