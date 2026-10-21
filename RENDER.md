@@ -39,6 +39,8 @@ JOB_TTL=300
 MAX_FILESIZE=100M
 MAX_DURATION=1800
 MAX_HEIGHT=720
+STREAM_FRAGMENTS=4
+STREAM_START_TIMEOUT=55
 ```
 
 The image defaults to `USE_WARP=1` and
@@ -78,6 +80,21 @@ curl -fsS -X POST "$API/" \
 Expected: a JSON response with `"status":"tunnel"` and a `/file/...` URL.
 Fetch that URL and verify a non-zero MP3. A 720p MP4 request uses
 `"downloadMode":"video","videoQuality":"720"`.
+
+Fast stream (v94 page):
+
+```bash
+curl -fsS -X POST "$API/stream" \
+  -H 'Origin: https://maxrtools.netlify.app' \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://www.youtube.com/watch?v=hjzAcsHbT0w","downloadMode":"audio","audioFormat":"mp3"}' \
+  -o test.mp3
+```
+
+The response is chunked and starts before the download finishes. Verify the
+MP3 is non-zero and playable. Use `"downloadMode":"auto","videoQuality":"720"`
+for MP4. If the first data takes too long, the server retries through WARP
+before sending any bytes, then returns a JSON error instead of a broken file.
 
 ## Limits to expect
 

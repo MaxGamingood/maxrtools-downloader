@@ -28,5 +28,9 @@ services:
         value: 1800
       - key: MAX_HEIGHT
         value: 720
+      - key: STREAM_FRAGMENTS
+        value: 4
+      - key: STREAM_START_TIMEOUT
+        value: 55
       - key: USE_WARP
         value: 1

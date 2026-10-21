@@ -18,7 +18,9 @@ import argparse
 import json
 import os
 import re
+import select
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -44,6 +46,8 @@ RATE_WINDOW = max(1, int(os.environ.get('RATE_WINDOW', '60')))
 MAX_FILESIZE = os.environ.get('MAX_FILESIZE', '100M').strip()
 MAX_DURATION = int(os.environ.get('MAX_DURATION', '1800'))
 MAX_HEIGHT = int(os.environ.get('MAX_HEIGHT', '1080'))
+STREAM_START_TIMEOUT = max(10, int(os.environ.get('STREAM_START_TIMEOUT', '55')))
+STREAM_FRAGMENTS = max(1, int(os.environ.get('STREAM_FRAGMENTS', '4')))
 PUBLIC_BASE_URL = os.environ.get('PUBLIC_BASE_URL', '').strip().rstrip('/')
 TRUST_PROXY = os.environ.get('TRUST_PROXY', '0').lower() in ('1', 'true', 'yes')
 YTDLP_PROXY = os.environ.get('YTDLP_PROXY', '').strip()
@@ -92,7 +96,8 @@ def build_cmd(binary, req, outdir, proxy=None, client=None):
     out = os.path.join(outdir, '%(title).80s [%(id)s].%(ext)s')
     cmd = [binary, '--no-playlist', '--no-progress', '--newline',
            '--socket-timeout', '30', '--retries', '3',
-           '--fragment-retries', '3', '-o', out]
+           '--fragment-retries', '3',
+           '--concurrent-fragments', str(STREAM_FRAGMENTS), '-o', out]
     if proxy:
         cmd += ['--proxy', proxy]
     if client in YT_CLIENTS:
@@ -115,6 +120,65 @@ def build_cmd(binary, req, outdir, proxy=None, client=None):
                 '--merge-output-format', 'mp4']
     cmd.append(str(req.get('url') or ''))
     return cmd
+
+
+def stream_quality(req):
+    quality = str(req.get('videoQuality') or '720').strip()
+    if quality not in QUAL:
+        quality = '720'
+    if quality != 'max':
+        try:
+            quality = str(min(int(quality), MAX_HEIGHT))
+        except ValueError:
+            quality = '720'
+    return quality
+
+
+def stream_format(req, kind):
+    """Return a yt-dlp format selector for one side of a live stream.
+
+    Video and audio are fetched by separate yt-dlp processes so ffmpeg can
+    start muxing as soon as both begin producing data.  The audio side is
+    forced to m4a where possible so the MP4 muxer can copy AAC without a
+    second encode.
+    """
+    if kind == 'audio':
+        return 'ba[ext=m4a]/ba/b'
+    quality = stream_quality(req)
+    cap = '' if quality == 'max' else '[height<=' + quality + ']'
+    return 'bv*' + cap + '[vcodec^=avc1]/bv*' + cap + '/b' + cap + '/b'
+
+
+def build_stream_cmd(binary, req, kind, proxy=None, client=None):
+    cmd = [binary, '--no-playlist', '--no-progress',
+           '--socket-timeout', '30', '--retries', '3',
+           '--fragment-retries', '3',
+           '--concurrent-fragments', str(STREAM_FRAGMENTS),
+           '-f', stream_format(req, kind), '-o', '-']
+    if proxy:
+        cmd += ['--proxy', proxy]
+    if client in YT_CLIENTS:
+        cmd += ['--extractor-args', 'youtube:player_client=' + client]
+    if MAX_FILESIZE:
+        cmd += ['--max-filesize', MAX_FILESIZE]
+    if MAX_DURATION > 0:
+        cmd += ['--match-filter', 'duration <= %d' % MAX_DURATION]
+    cmd.append(str(req.get('url') or ''))
+    return cmd
+
+
+def build_stream_mux(req, video_fd=None, audio_fd=None):
+    if video_fd is None:
+        return ['ffmpeg', '-hide_banner', '-loglevel', 'error',
+                '-i', 'pipe:%d' % audio_fd, '-vn',
+                '-c:a', 'libmp3lame', '-b:a', '192k',
+                '-f', 'mp3', 'pipe:1']
+    return ['ffmpeg', '-hide_banner', '-loglevel', 'error',
+            '-i', 'pipe:%d' % video_fd, '-i', 'pipe:%d' % audio_fd,
+            '-map', '0:v:0', '-map', '1:a:0', '-c', 'copy',
+            '-bsf:a', 'aac_adtstoasc',
+            '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+            '-f', 'mp4', 'pipe:1']
 
 
 def safe_detail(text):
@@ -275,6 +339,7 @@ class Handler(BaseHTTPRequestHandler):
                 'status': 'ok',
                 'name': 'MaxTools hosted downloader',
                 'account': False,
+                'stream': True,
             })
         if path == '/':
             binary = find_ytdlp()
@@ -283,6 +348,7 @@ class Handler(BaseHTTPRequestHandler):
                 'name': 'MaxTools hosted downloader',
                 'account': False,
                 'proxy': bool(YTDLP_PROXY),
+                'stream': True,
                 'ytdlp': yt_version(binary) if binary else None,
             })
         self._json(404, error('error.file.gone'))
@@ -310,28 +376,303 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             shutil.rmtree(os.path.dirname(job['path']), ignore_errors=True)
 
-    def do_POST(self):
-        if urlparse(self.path).path != '/':
-            return self._json(404, error('error.api.link.invalid'))
-        if not self._origin_allowed():
-            self.close_connection = True
-            return self._json(403, error('error.api.origin.denied'))
+    def _read_req(self):
         try:
             length = int(self.headers.get('Content-Length') or 0)
         except ValueError:
             length = 0
         if length <= 0:
             self.close_connection = True
-            return self._json(400, error('error.api.link.invalid'))
+            self._json(400, error('error.api.link.invalid'))
+            return None
         if length > MAX_BODY:
             self.close_connection = True
-            return self._json(413, error('error.api.body.too_large'))
+            self._json(413, error('error.api.body.too_large'))
+            return None
         try:
             req = json.loads(self.rfile.read(length).decode('utf-8') or '{}')
         except Exception:
-            return self._json(400, error('error.api.link.invalid'))
+            self._json(400, error('error.api.link.invalid'))
+            return None
         if not isinstance(req, dict):
-            return self._json(400, error('error.api.link.invalid'))
+            self._json(400, error('error.api.link.invalid'))
+            return None
+        return req
+
+    def _stream_stderr(self, stream):
+        parts = []
+        for fh in stream.get('errs', []):
+            try:
+                fh.seek(0)
+                text = fh.read().decode('utf-8', 'replace')
+                if text.strip():
+                    parts.append(text.strip()[-1200:])
+            except Exception:
+                pass
+        return safe_detail(' | '.join(parts)[-1200:])
+
+    def _kill_stream(self, stream):
+        for proc in list(stream.get('procs', [])) + [stream.get('ff')]:
+            if not proc or proc.poll() is not None:
+                continue
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    def _start_stream(self, binary, req, proxy, client):
+        """Start yt-dlp and ffmpeg, returning pipes ready for the first byte."""
+        mode = str(req.get('downloadMode') or '')
+        procs = []
+        errs = []
+        ff = None
+
+        def errfile():
+            fh = tempfile.TemporaryFile()
+            errs.append(fh)
+            return fh
+
+        try:
+            if mode == 'audio':
+                a = subprocess.Popen(
+                    build_stream_cmd(binary, req, 'audio', proxy, client),
+                    stdout=subprocess.PIPE, stderr=errfile(),
+                    start_new_session=True)
+                procs.append(a)
+                afd = a.stdout.fileno()
+                ff = subprocess.Popen(
+                    build_stream_mux(req, audio_fd=afd),
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=errfile(), pass_fds=(afd,),
+                    start_new_session=True)
+                a.stdout.close()
+            else:
+                v = subprocess.Popen(
+                    build_stream_cmd(binary, req, 'video', proxy, client),
+                    stdout=subprocess.PIPE, stderr=errfile(),
+                    start_new_session=True)
+                a = subprocess.Popen(
+                    build_stream_cmd(binary, req, 'audio', proxy, client),
+                    stdout=subprocess.PIPE, stderr=errfile(),
+                    start_new_session=True)
+                procs.extend([v, a])
+                vfd = v.stdout.fileno()
+                afd = a.stdout.fileno()
+                ff = subprocess.Popen(
+                    build_stream_mux(req, video_fd=vfd, audio_fd=afd),
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=errfile(), pass_fds=(vfd, afd),
+                    start_new_session=True)
+                v.stdout.close()
+                a.stdout.close()
+            return {'procs': procs, 'ff': ff, 'errs': errs}
+        except Exception:
+            for proc in procs:
+                try:
+                    if proc.stdout:
+                        proc.stdout.close()
+                except Exception:
+                    pass
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            if ff:
+                try:
+                    ff.kill()
+                except Exception:
+                    pass
+            for fh in errs:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+            raise
+
+    def _stop_stream(self, stream):
+        self._kill_stream(stream)
+        for fh in stream.get('errs', []):
+            try:
+                fh.close()
+            except Exception:
+                pass
+
+    def _write_chunk(self, data):
+        self.wfile.write(('%X\r\n' % len(data)).encode('ascii'))
+        self.wfile.write(data)
+        self.wfile.write(b'\r\n')
+
+    def _stream(self, req):
+        client = self.headers.get('X-MaxTools-Client', '').strip()
+        if client not in YT_CLIENTS:
+            client = None
+        ip = client_ip(self)
+        if not rate_ok(ip):
+            return self._json(429, error('error.api.rate_exceeded'))
+        if not SEM.acquire(blocking=False):
+            return self._json(429, error('error.api.rate_exceeded'))
+        st = None
+        timer = None
+        started = time.time()
+        try:
+            binary = find_ytdlp()
+            if not binary:
+                return self._json(200, error('error.api.ytdlp.missing'))
+            if str(req.get('downloadMode') or '') == 'audio':
+                fmt = str(req.get('audioFormat') or 'mp3').lower()
+                if fmt != 'mp3':
+                    return self._json(200, error(
+                        'error.api.stream.unsupported',
+                        'Live streaming is only available for MP3 audio'))
+            proxies = [None]
+            if YTDLP_PROXY:
+                proxies.append(YTDLP_PROXY)
+            first = b''
+            detail = ''
+            used_proxy = None
+            for idx, proxy in enumerate(proxies):
+                try:
+                    st = self._start_stream(binary, req, proxy, client)
+                except Exception as exc:
+                    detail = safe_detail(exc)
+                    if idx == len(proxies) - 1:
+                        return self._json(200, error('error.api.fetch.fail', detail))
+                    continue
+                timer = threading.Timer(TIMEOUT, self._kill_stream, args=(st,))
+                timer.daemon = True
+                timer.start()
+                fd = st['ff'].stdout.fileno()
+                deadline = time.time() + STREAM_START_TIMEOUT
+                while time.time() < deadline:
+                    ready, _, _ = select.select([fd], [], [], 0.5)
+                    if ready:
+                        try:
+                            first = os.read(fd, 65536)
+                        except OSError:
+                            first = b''
+                        break
+                    if st['ff'].poll() is not None:
+                        try:
+                            first = os.read(fd, 65536)
+                        except OSError:
+                            first = b''
+                        break
+                if first:
+                    used_proxy = proxy
+                    break
+                detail = self._stream_stderr(st) or 'Live stream produced no data'
+                self._stop_stream(st)
+                st = None
+                if timer:
+                    timer.cancel()
+                    timer = None
+                if not YTDLP_PROXY:
+                    break
+            if not first or not st:
+                code = classify_failure(detail)
+                return self._json(200, error(code, detail))
+
+            mode = str(req.get('downloadMode') or '')
+            ext = 'mp3' if mode == 'audio' else 'mp4'
+            ctype = 'audio/mpeg' if mode == 'audio' else 'video/mp4'
+            vid = ''
+            m = re.search(r'(?:v=|youtu\.be/|shorts/|embed/|live/)([\w-]{11})',
+                          str(req.get('url') or ''))
+            if m:
+                vid = '-' + m.group(1)
+            name = 'maxrtools' + vid + '.' + ext
+            self.send_response(200)
+            self._cors()
+            self.send_header('Content-Type', ctype)
+            self.send_header('Content-Disposition',
+                             'attachment; filename="%s"' % name)
+            self.send_header('Transfer-Encoding', 'chunked')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('X-Accel-Buffering', 'no')
+            self.send_header('Access-Control-Expose-Headers',
+                             'Content-Disposition, Content-Type')
+            self.end_headers()
+            self.close_connection = True
+            self._write_chunk(first)
+            total = len(first)
+            last_data = time.time()
+            completed = True
+            fd = st['ff'].stdout.fileno()
+            while True:
+                if st['ff'].poll() is not None:
+                    while True:
+                        try:
+                            data = os.read(fd, 65536)
+                        except OSError:
+                            data = b''
+                        if not data:
+                            break
+                        self._write_chunk(data)
+                        total += len(data)
+                    completed = st['ff'].returncode == 0
+                    break
+                if time.time() - last_data > 180:
+                    completed = False
+                    break
+                ready, _, _ = select.select([fd], [], [], 1.0)
+                if not ready:
+                    continue
+                try:
+                    data = os.read(fd, 65536)
+                except OSError:
+                    data = b''
+                if not data:
+                    try:
+                        completed = st['ff'].wait(timeout=5) == 0
+                    except Exception:
+                        completed = False
+                    break
+                self._write_chunk(data)
+                total += len(data)
+                last_data = time.time()
+            if completed:
+                for proc in st['procs']:
+                    if proc.poll() is None:
+                        try:
+                            proc.wait(timeout=5)
+                        except Exception:
+                            completed = False
+                    if proc.returncode not in (0, None):
+                        completed = False
+            if completed:
+                self.wfile.write(b'0\r\n\r\n')
+            else:
+                print('[hosted] stream incomplete mode=%s bytes=%d' % (
+                    mode or 'video', total), flush=True)
+            elapsed = time.time() - started
+            print('[hosted] stream %.1fs mode=%s bytes=%d proxy=%s client=%s' % (
+                elapsed, mode or 'video', total,
+                'yes' if used_proxy else 'no', client or 'default'), flush=True)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:
+            print('[hosted] stream exception: ' + traceback.format_exc()[-4000:],
+                  flush=True)
+        finally:
+            if timer:
+                timer.cancel()
+            if st:
+                self._stop_stream(st)
+            SEM.release()
+
+    def do_POST(self):
+        path = urlparse(self.path).path
+        if path not in ('/', '/stream'):
+            return self._json(404, error('error.api.link.invalid'))
+        if not self._origin_allowed():
+            self.close_connection = True
+            return self._json(403, error('error.api.origin.denied'))
+        req = self._read_req()
+        if req is None:
+            return
         url = str(req.get('url') or '').strip()
         if not YT_RE.match(url):
             return self._json(200, error('error.api.link.invalid'))
@@ -343,6 +684,8 @@ class Handler(BaseHTTPRequestHandler):
         client = self.headers.get('X-MaxTools-Client', '').strip()
         if client not in YT_CLIENTS:
             client = None
+        if path == '/stream':
+            return self._stream(req)
         ip = client_ip(self)
         if not rate_ok(ip):
             return self._json(429, error('error.api.rate_exceeded'))

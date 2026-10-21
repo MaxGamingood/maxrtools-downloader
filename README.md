@@ -24,6 +24,7 @@ The service is cobalt-compatible for the subset MaxTools uses:
 GET  /                 status
 GET  /health           lightweight health check
 POST /                 start a download, return a tunnel URL
+POST /stream            live-stream the finished file while it downloads
 GET  /file/<job-id>    stream the finished file (deleted after serving)
 HEAD /                 health-check probe
 OPTIONS /              CORS preflight
