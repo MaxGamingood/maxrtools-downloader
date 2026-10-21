@@ -1,9 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Use the host resolver rather than sending DNS through WARP. YouTube DNS is
-# not blocked on Render, and local resolution avoids a slow proxy round-trip.
-WARP_PROXY="socks5://127.0.0.1:25344"
+WARP_PROXY="socks5h://127.0.0.1:25344"
 
 if [ "${USE_WARP:-0}" = "1" ]; then
     mkdir -p /tmp/warp
