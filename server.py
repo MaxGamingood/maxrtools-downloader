@@ -527,9 +527,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, error(
                         'error.api.stream.unsupported',
                         'Live streaming is only available for MP3 audio'))
-            proxies = [None]
-            if YTDLP_PROXY:
-                proxies.append(YTDLP_PROXY)
+            # Hosted deployments need WARP: YouTube treats Render's datacenter
+            # IPs as bots. Try the proxy first, then fall back to direct for
+            # self-hosted deployments where the host IP is already clean.
+            proxies = [YTDLP_PROXY] if YTDLP_PROXY else []
+            proxies.append(None)
             first = b''
             detail = ''
             used_proxy = None
